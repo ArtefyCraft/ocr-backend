@@ -1,0 +1,28 @@
+# OCR Bridge Service — Python dependencies
+# Install: pip install -r requirements.txt
+#
+# System requirements (must be installed separately — not via pip):
+#   Tesseract OCR:  https://github.com/UB-Mannheim/tesseract/wiki  (Windows)
+#                   apt install tesseract-ocr tesseract-ocr-lav     (Debian/Ubuntu)
+#   Poppler:        https://github.com/oschwartz10612/poppler-windows/releases (Windows)
+#                   apt install poppler-utils                        (Debian/Ubuntu)
+#
+# The Latvian language pack (lav) is required for Tesseract.
+# Verify with: tesseract --list-langs | grep lav
+
+# Web framework (bridge service)
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+
+# PDF text extraction
+pdfplumber>=0.10.0
+
+# Image OCR
+pytesseract>=0.3.10
+Pillow>=10.0.0
+
+# PDF → image conversion (for scanned invoice OCR)
+pdf2image>=1.17.0
+
+# Pydantic (used by FastAPI — pinned for compatibility)
+pydantic>=2.0.0
