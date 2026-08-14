@@ -106,6 +106,157 @@ _INVOICE_SIGNALS = [
 ]
 
 # ---------------------------------------------------------------------------
+# _CLUSTER_A_v1 — Verbatim classifier prescan (LV document-family tokens)
+#
+# Runs AFTER OCR (image path) or PDF text extraction (PDF path) inside
+# `classify_document`. Scans the header region for a whitelisted LV token;
+# on hit, emits `verbatim_prescan={verbatim_hit, route_hint, matched_token,
+# fuzzy_distance, matched_line}` on the classification dict. Downstream
+# `process_master_bridge` decides shadow (log-only) vs enforce (override
+# routing) based on env `VERBATIM_CLASSIFIER=off|shadow|enforce`.
+#
+# Design fixes from workflow-1 adversarial critic:
+#   - P0-1 chicken-and-egg SOLVED: scanner runs INSIDE classify_document
+#     which has already produced OCR text (image L242, PDF L282).
+#   - P0-3 z/x collision: kept exact-match-only (dist=0) since 'z-atskaite'
+#     vs 'x-atskaite' differ by exactly 1 char.
+#   - Cluster A halt Option A (2026-08-11 halt decision): scanner in bridge
+#     post-OCR, before family dispatch — this file.
+# ---------------------------------------------------------------------------
+
+# Whitelist: [normalized_token, route_hint, standalone_only, allow_fuzzy]
+# Order matters — multi-word first, most specific first.
+_VERBATIM_WHITELIST: list[tuple[str, str, bool, bool]] = [
+    ("savstarpējais ieskaits", "credit_note",     False, True),
+    ("ieskaita akts",          "credit_note",     False, True),
+    ("kredīta rēķins",         "credit_note",     False, True),
+    ("kredītrēķins",           "credit_note",     False, True),
+    ("avansa rēķins",          "advance_invoice", False, True),
+    ("priekšapmaksa",          "advance_invoice", False, True),
+    ("pro forma",              "advance_invoice", False, True),
+    ("pro-forma",              "advance_invoice", False, True),
+    # z/x — EXACT match only (dist=0) — critic P0-3: fuzzy-1 collision
+    ("z-atskaite",             "receipt_z",       False, False),
+    ("x-atskaite",             "receipt_x",       False, False),
+    # standalone-only guarded — 'pavadzīme' collides with 'rēķins-pavadzīme'
+    ("pavadzīme",              "delivery_note",   True,  True),
+]
+
+_HEADER_CHAR_LIMIT = 800
+_HEADER_LINE_LIMIT = 15
+
+
+def _lev(a: str, b: str) -> int:
+    """Levenshtein distance capped at |len(a)-len(b)| shortcut; O(len(a)*len(b))."""
+    if not a or not b:
+        return 99
+    m, n = len(a), len(b)
+    if abs(m - n) > 3:
+        return abs(m - n)
+    prev_row = list(range(n + 1))
+    for i in range(1, m + 1):
+        cur_row = [i] + [0] * n
+        for j in range(1, n + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            cur_row[j] = min(cur_row[j - 1] + 1, prev_row[j] + 1, prev_row[j - 1] + cost)
+        prev_row = cur_row
+    return prev_row[n]
+
+
+def _normalize_line(s: str) -> str:
+    # Lowercase, collapse whitespace, strip zero-width, keep LV diacritics.
+    return re.sub(r"\s+", " ", re.sub(r"[​-‍﻿]", "", s.lower())).strip()
+
+
+def _header_lines(text: str) -> list[str]:
+    clipped = text[:_HEADER_CHAR_LIMIT]
+    lines = [_normalize_line(ln) for ln in clipped.splitlines()[:_HEADER_LINE_LIMIT]]
+    return [ln for ln in lines if ln]
+
+
+def _scan_line(nline: str, token: str, allow_fuzzy: bool) -> dict:
+    """Return {dist, exact} for the best match of `token` inside `nline`."""
+    if token in nline:
+        return {"dist": 0, "exact": True}
+    if not allow_fuzzy:
+        return {"dist": 99, "exact": False}
+    tl = len(token)
+    best = 99
+    # Slide a window of length tl±1 across the line, keep best distance
+    for w in range(max(3, tl - 1), tl + 2):
+        for i in range(0, max(0, len(nline) - w + 1)):
+            chunk = nline[i : i + w]
+            # cheap 3-gram prefilter
+            if tl >= 4 and len(chunk) >= 4:
+                if chunk[:3] != token[:3] and chunk[-3:] != token[-3:]:
+                    continue
+            d = _lev(chunk, token)
+            if d < best:
+                best = d
+            if best == 0:
+                return {"dist": 0, "exact": True}
+    return {"dist": best, "exact": False}
+
+
+def _passes_standalone_guard(nline: str, token: str) -> bool:
+    """`pavadzīme` must NOT be part of `rēķins-pavadzīme` (hybrid invoice)."""
+    if token != "pavadzīme":
+        return True
+    if re.search(r"\br[ēe]ķins\b", nline):
+        return False
+    if re.search(r"\brēķins-?pavadzīme\b", nline):
+        return False
+    if re.search(r"\bkv[īi]ts\b", nline):
+        return False
+    return True
+
+
+def verbatim_prescan(text: str) -> dict:
+    """
+    Scan the header region of `text` for a whitelisted LV document-family
+    token. First hit wins (whitelist ordered specific → general).
+
+    Returns:
+      {
+        "verbatim_hit":    bool,
+        "route_hint":      str | None,   # credit_note | advance_invoice | delivery_note | receipt_z | receipt_x
+        "matched_token":   str | None,
+        "fuzzy_distance":  int | None,   # 0 = exact, 1 = one edit
+        "matched_line":    str | None,
+        "standalone_only": bool | None,
+        "scanner_version": "cluster_a_v1_shadow"
+      }
+
+    Pure function; never raises. Empty text = no-op (verbatim_hit=False).
+    """
+    empty = {
+        "verbatim_hit": False,
+        "route_hint": None,
+        "matched_token": None,
+        "fuzzy_distance": None,
+        "matched_line": None,
+        "standalone_only": None,
+        "scanner_version": "cluster_a_v1_shadow",
+    }
+    if not text:
+        return empty
+    for nline in _header_lines(text):
+        for token, route, standalone_only, allow_fuzzy in _VERBATIM_WHITELIST:
+            res = _scan_line(nline, token, allow_fuzzy)
+            if res["dist"] <= (1 if allow_fuzzy else 0) and _passes_standalone_guard(nline, token):
+                return {
+                    "verbatim_hit": True,
+                    "route_hint": route,
+                    "matched_token": token,
+                    "fuzzy_distance": res["dist"],
+                    "matched_line": nline,
+                    "standalone_only": standalone_only,
+                    "scanner_version": "cluster_a_v1_shadow",
+                }
+    return empty
+
+
+# ---------------------------------------------------------------------------
 # Physical type
 # ---------------------------------------------------------------------------
 
@@ -221,21 +372,31 @@ def classify_document(
         "telecom_score": int,
         "invoice_score": int,
         "text_length":   int,
+        "verbatim_prescan": dict,  # _CLUSTER_A_v1 shadow scan result
       }
     """
     path = Path(file_path)
     hint = _hint_from_source_type(source_type)
 
+    # _CLUSTER_A_v1 — captured OCR text for verbatim prescan. Populated by
+    # image OCR / PDF text-extract branches below; _finalize attaches it to
+    # every return so downstream can decide shadow vs enforce override.
+    ocr_text_for_prescan: str = ""
+
+    def _finalize(result: dict) -> dict:
+        result["verbatim_prescan"] = verbatim_prescan(ocr_text_for_prescan)
+        return result
+
     # ── Physical type ──────────────────────────────────────────────────────
     phys = detect_physical_type(str(path))
 
     if phys == "unknown":
-        return {
+        return _finalize({
             "family": "unknown", "confidence": "low",
             "reason": f"Unrecognised file extension '{path.suffix}'",
             "physical_type": phys, "telecom_score": 0, "invoice_score": 0, "text_length": 0,
             "page_count": 0,
-        }
+        })
 
     # ── Image: content-based classification via quick OCR pass ────────────
     if phys == "image":
@@ -243,6 +404,8 @@ def classify_document(
         inv_score    = _score_signals(ocr_text, _INVOICE_SIGNALS) if ocr_text else 0
         tel_score    = _score_signals(ocr_text, _TELECOM_SIGNALS) if ocr_text else 0
         text_len     = len(ocr_text.replace(" ", "").replace("\n", "")) if ocr_text else 0
+        # _CLUSTER_A_v1: capture OCR text so _finalize can prescan it.
+        ocr_text_for_prescan = ocr_text or ""
 
         # Invoice/delivery note signals in image → treat as scanned document.
         # Threshold 3: a lone PVN registration number (2 pts) appears on POS
@@ -256,12 +419,12 @@ def classify_document(
             )
             if hint and hint != "scanned_invoice_pdf":
                 reason += f" (source_type hint '{source_type}' overridden by content)"
-            return {
+            return _finalize({
                 "family": "scanned_invoice_pdf", "confidence": conf, "reason": reason,
                 "physical_type": phys, "telecom_score": tel_score,
                 "invoice_score": inv_score, "text_length": text_len,
                 "page_count": 0,
-            }
+            })
 
         # Default: receipt_image
         conf = "high" if hint in (None, "receipt_image") else "medium"
@@ -271,16 +434,18 @@ def classify_document(
             reason = "Image → receipt_image (OCR returned no text, assumed receipt)"
         if hint and hint != "receipt_image":
             reason += f" (source_type hint '{source_type}' noted but content overrides)"
-        return {
+        return _finalize({
             "family": "receipt_image", "confidence": conf, "reason": reason,
             "physical_type": phys, "telecom_score": tel_score,
             "invoice_score": inv_score, "text_length": text_len,
             "page_count": 0,
-        }
+        })
 
     # ── PDF: extract text for classification ──────────────────────────────
     text, page_count = _extract_pdf_text_for_classification(str(path))
     text_len = len(text.replace(" ", "").replace("\n", ""))
+    # _CLUSTER_A_v1: capture text so _finalize can prescan it.
+    ocr_text_for_prescan = text or ""
 
     # No text layer → scanned invoice
     if text_len < MIN_TEXT_CHARS:
@@ -288,11 +453,11 @@ def classify_document(
         reason = f"PDF has no text layer (chars={text_len}) → scanned_invoice_pdf"
         if hint and hint != "scanned_invoice_pdf":
             reason += f" (source_type hint '{source_type}' overridden by content)"
-        return {
+        return _finalize({
             "family": "scanned_invoice_pdf", "confidence": conf, "reason": reason,
             "physical_type": phys, "telecom_score": 0, "invoice_score": 0, "text_length": text_len,
             "page_count": page_count,
-        }
+        })
 
     # Score signals
     telecom_score = _score_signals(text, _TELECOM_SIGNALS)
@@ -310,22 +475,22 @@ def classify_document(
     if telecom_score >= MIN_SCORE and telecom_score > invoice_score and gap >= MIN_SCORE_GAP:
         conf = "high" if telecom_score >= 5 else "medium"
         reason = f"Telecom signals dominant (telecom={telecom_score}, invoice={invoice_score})"
-        return {
+        return _finalize({
             "family": "telecom_pdf", "confidence": conf, "reason": reason,
             "physical_type": phys, "telecom_score": telecom_score,
             "invoice_score": invoice_score, "text_length": text_len,
             "page_count": page_count,
-        }
+        })
 
     if invoice_score >= MIN_SCORE and invoice_score > telecom_score and gap >= MIN_SCORE_GAP:
         conf = "high" if invoice_score >= 5 else "medium"
         reason = f"Invoice signals dominant (invoice={invoice_score}, telecom={telecom_score})"
-        return {
+        return _finalize({
             "family": "digital_invoice_pdf", "confidence": conf, "reason": reason,
             "physical_type": phys, "telecom_score": telecom_score,
             "invoice_score": invoice_score, "text_length": text_len,
             "page_count": page_count,
-        }
+        })
 
     # Ambiguous
     reason = (
@@ -334,9 +499,9 @@ def classify_document(
     )
     if telecom_score == 0 and invoice_score == 0:
         reason = f"No family signals found in PDF text (text_len={text_len})"
-    return {
+    return _finalize({
         "family": "unknown", "confidence": "low", "reason": reason,
         "physical_type": phys, "telecom_score": telecom_score,
         "invoice_score": invoice_score, "text_length": text_len,
         "page_count": page_count,
-    }
+    })

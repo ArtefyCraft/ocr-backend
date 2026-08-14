@@ -27,12 +27,50 @@ Master output contract:
   error_message     str?
 """
 
+import os
 import sys
 import json
 from pathlib import Path
 from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# _CLUSTER_A_v1 — VERBATIM_CLASSIFIER routing behind env flag.
+#
+# Values: off (default) | shadow | enforce
+#   off      → scanner still runs inside classify_document + result attached
+#              to classification.verbatim_prescan for observability. No routing
+#              change.
+#   shadow   → same as off but sets a `verbatim_classifier_mode` marker so
+#              downstream logs / metrics can segment.
+#   enforce  → verbatim hits with a family that has a DEDICATED bridge
+#              (currently ONLY the pre-existing families) override the
+#              heuristic classifier. Hits for NEW families with no bridge yet
+#              (credit_note / advance_invoice / delivery_note / receipt_z /
+#              receipt_x) set status=NEEDS_REVIEW instead of silently misrouting.
+_VERBATIM_MODES = {"off", "shadow", "enforce"}
+_ENFORCE_UNIMPLEMENTED_ROUTES = {
+    "credit_note",
+    "advance_invoice",
+    "delivery_note",
+    "receipt_z",
+    "receipt_x",
+}
+
+
+def _resolve_verbatim_mode() -> str:
+    raw = (os.environ.get("VERBATIM_CLASSIFIER", "") or "").strip().lower()
+    if raw in _VERBATIM_MODES:
+        return raw
+    # Unknown values (typo like "SHADOWW", "on", "true") fall back to off
+    # with a stderr warning so a misconfigured flag surfaces on first request.
+    if raw:
+        print(
+            f"[cluster-a] WARN: unknown VERBATIM_CLASSIFIER value {raw!r} "
+            f"— falling back to 'off'. Expected: off | shadow | enforce.",
+            file=sys.stderr,
+        )
+    return "off"
 
 IMAGE_EXTENSIONS = {".jpeg", ".jpg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
 PDF_EXTENSIONS   = {".pdf"}
@@ -150,7 +188,31 @@ def process_master_bridge(payload: dict) -> dict:
         return _failed(payload, DECISION_CLASSIFICATION_FAIL,
                        f"Classification error: {exc}")
 
+    # _CLUSTER_A_v1 — verbatim classifier prescan integration.
+    # classify_document attaches verbatim_prescan={verbatim_hit, route_hint, ...}
+    # to its result. Here we optionally override family routing per env flag.
+    verbatim_mode = _resolve_verbatim_mode()
+    prescan = classification.get("verbatim_prescan") or {}
+    classification["verbatim_classifier_mode"] = verbatim_mode
     family = classification.get("family", "unknown")
+
+    if verbatim_mode == "enforce" and prescan.get("verbatim_hit"):
+        route_hint = prescan.get("route_hint")
+        # Only override when the target family HAS a dedicated bridge —
+        # otherwise mark NEEDS_REVIEW so the operator handles it manually
+        # (no silent misroute into wrong extractor).
+        if route_hint in _ENFORCE_UNIMPLEMENTED_ROUTES:
+            out = _base_output(payload, classification)
+            out["status"] = "NEEDS_REVIEW"
+            out["router_decision"] = f"verbatim_route_unimplemented_{route_hint}"
+            out["error_message"] = (
+                f"Verbatim scanner detected '{prescan.get('matched_token')}' "
+                f"→ route {route_hint!r} has no dedicated bridge yet — "
+                f"NEEDS_REVIEW (Cluster A ships shadow-only; per-family "
+                f"bridges land in a later chunk)."
+            )
+            return out
+        # route_hint is None or matches a family we already handle — no-op.
 
     # Unknown family → cannot route
     if family == "unknown":
