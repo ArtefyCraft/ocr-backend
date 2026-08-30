@@ -260,6 +260,7 @@ def root():
             "POST /process-scanned-invoice": "Extract scanned invoice data from PDF via OCR",
             "POST /process-receipt": "Extract receipt data from image via OCR",
             "POST /process-master": "Auto-classify and extract from any supported document",
+            "POST /preprocess-receipt": "Crop receipt-paper band + tile under Vision pixel budget (_RECEIPT_TILING_v1)",
         },
         "usage": {
             "local": "POST any endpoint with source_file",
@@ -773,6 +774,23 @@ def extract_raw(req: ProcessRequest):
                 tmp_path.unlink(missing_ok=True)
             except Exception:
                 pass
+
+
+@app.post("/preprocess-receipt", tags=["preprocessing"])
+def preprocess_receipt(req: ProcessRequest):
+    """
+    _RECEIPT_TILING_v1 — crop the receipt-paper band and tile tall crops so
+    every tile stays under the Anthropic Vision ~1.15MP server-side downscale
+    budget (nothing gets downscaled -> ~1.2-1.8x effective text size).
+
+    Contract: NEVER fails the caller. On any internal error (or
+    RECEIPT_PREPROCESS=off, or PDF input) returns the original base64 as a
+    single tile with fallback=true so the bridge behaves exactly as today.
+    """
+    if not req.file_content_base64:
+        raise HTTPException(status_code=400, detail="file_content_base64 required")
+    from tools.receipt_preprocess import preprocess_receipt_image
+    return preprocess_receipt_image(req.file_content_base64, req.mime_type)
 
 
 @app.post("/extract", tags=["extraction"])
