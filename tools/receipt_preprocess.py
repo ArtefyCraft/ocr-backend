@@ -105,6 +105,17 @@ def _paper_band(grey: "Image.Image") -> tuple[int, int] | None:
     if band_ink < MIN_BAND_INK_FRAC or band_ink > 0.60:
         return None
 
+    # Hysteresis edge extension (2026-08-31, wa_01 live finding): a skewed
+    # receipt or edge shadow makes brightness fall off gradually at the paper
+    # edge; the strict 55% detection threshold then clips the PRICE COLUMN at
+    # the right edge (items read, amounts lost). Extend both edges while
+    # columns stay above a laxer 35% threshold.
+    ext_thresh = lo + (hi - lo) * 0.35
+    while x0s > 0 and col_mean[x0s - 1] >= ext_thresh:
+        x0s -= 1
+    while x1s < sw - 1 and col_mean[x1s + 1] >= ext_thresh:
+        x1s += 1
+
     inv = 1.0 / scale if scale < 1.0 else 1.0
     return int(x0s * inv), int(min(w, (x1s + 1) * inv))
 
