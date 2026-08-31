@@ -146,8 +146,10 @@ def preprocess_receipt_image(file_b64: str, mime_type: str | None = None) -> dic
     """
     passthrough = {"tiles": [file_b64], "tile_count": 1, "fallback": True}
 
-    if os.environ.get("RECEIPT_PREPROCESS", "on").lower() in ("off", "0", "false"):
-        return {**passthrough, "error": "RECEIPT_PREPROCESS=off"}
+    # Default OFF (F2b critic P0-2): dormancy must be fail-safe — an env wipe /
+    # service recreation must NOT silently re-enable the crop. Opt-in only.
+    if os.environ.get("RECEIPT_PREPROCESS", "off").lower() not in ("on", "1", "true"):
+        return {**passthrough, "error": "RECEIPT_PREPROCESS off (default)"}
     if not _HAS_PIL:
         return {**passthrough, "error": "Pillow unavailable"}
     if mime_type == "application/pdf":
